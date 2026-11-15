@@ -6,7 +6,7 @@ import typing as t
 from dataclasses import dataclass, field
 
 from sqlglot import Schema, exp, maybe_parse
-from sqlglot.errors import SqlglotError
+from sqlglot.errors import OptimizeError, SqlglotError
 from sqlglot.optimizer import Scope, build_scope, find_all_in_scope, normalize_identifiers, qualify
 from sqlglot.optimizer.scope import ScopeType
 from sqlglot.schema import ensure_schema
@@ -110,7 +110,8 @@ def lineage(
 
     Args:
         column: The column to build the lineage for. Pass None to get all output columns.
-        sql: The SQL string or expression.
+        sql: The SQL string or expression. INSERT, UPDATE and MERGE statements are
+            traced through the columns they assign.
         schema: The schema of tables.
         sources: A mapping of queries which will be used to continue building lineage.
         dialect: The dialect of input SQL.
@@ -140,13 +141,36 @@ def lineage(
 
     schema = ensure_schema(schema, dialect=dialect)
 
+    dml_select = None
     if not scope:
-        expression = qualify.qualify(
-            expression,
-            dialect=dialect,
-            schema=schema,
-            **{"validate_qualify_columns": False, "identify": False, **kwargs},  # type: ignore
-        )
+        dml_select = _dml_select(expression)
+        if dml_select is not None:
+            expression = dml_select
+
+    if not scope:
+        qualify_kwargs = {"validate_qualify_columns": False, "identify": False, **kwargs}
+        try:
+            expression = qualify.qualify(
+                expression,
+                dialect=dialect,
+                schema=schema,
+                **qualify_kwargs,  # type: ignore
+            )
+        except OptimizeError:
+            if dml_select is None:
+                raise
+
+            # A DML assignment can hold a scalar subquery over tables that aren't in the
+            # schema, which column qualification can't resolve. The DML rewrite only
+            # needs tables and aliases to be qualified, so retry without column resolution.
+            qualify_kwargs.pop("qualify_columns", None)
+            expression = qualify.qualify(
+                expression,
+                dialect=dialect,
+                schema=schema,
+                qualify_columns=False,
+                **qualify_kwargs,  # type: ignore
+            )
         scope = build_scope(expression)
 
     if not scope:
@@ -195,6 +219,184 @@ def lineage(
         )
 
     return result
+
+
+def _dml_select(expression: exp.Expr) -> exp.Query | None:
+    """
+    Rewrite a DML statement into an equivalent SELECT whose projections are the
+    columns the statement writes, so the existing lineage walk can be reused.
+
+    INSERT projects its query's columns under the target column list, UPDATE and
+    MERGE project the right-hand side of each SET assignment (and each merged
+    INSERT's VALUES), alongside the relations those expressions can reference.
+
+    Returns None for anything that isn't a covered DML statement.
+    """
+    if isinstance(expression, exp.Insert):
+        query = expression.expression
+        if not isinstance(query, exp.Query):
+            return None
+
+        query = query.copy()
+        while isinstance(query, exp.Subquery):
+            # INSERT INTO t (a) (SELECT ...)
+            query = query.this.copy()
+
+        target = expression.this
+        if (
+            isinstance(target, exp.Schema)
+            and target.expressions
+            and not expression.args.get("by_name")
+        ):
+            # With BY NAME the target columns are matched by the projections' names,
+            # so the query's output names already are the target column names
+            _rename_projections(query, [column.name for column in target.expressions])
+
+        # A statement-level WITH belongs to the query's own scope
+        with_ = expression.args.get("with_")
+        if with_ is not None and not query.args.get("with_"):
+            query.set("with_", with_.copy())
+
+        _name_subquery_projections(query)
+        return query
+
+    if isinstance(expression, exp.Update):
+        projections = _assignment_projections(expression.expressions)
+        if not projections:
+            return None
+
+        relations: list[exp.Expr] = []
+        if isinstance(expression.this, exp.Table):
+            relations.append(expression.this.copy())
+
+        from_ = expression.args.get("from_")
+        if isinstance(from_, exp.From) and isinstance(from_.this, exp.Expr):
+            # Joins (including comma-separated ones) hang off the FROM's first source
+            relations.append(from_.this.copy())
+
+        return _projection_select(projections, relations, expression)
+
+    if isinstance(expression, exp.Merge):
+        projections: list[tuple[str, exp.Expr]] = []
+
+        for when in expression.args["whens"].expressions:
+            then = when.args.get("then")
+
+            if isinstance(then, exp.Update):
+                projections.extend(_assignment_projections(then.expressions))
+            elif isinstance(then, exp.Insert):
+                # WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.y)
+                columns, values = then.this, then.expression
+                if isinstance(columns, exp.Tuple) and isinstance(values, exp.Tuple):
+                    projections.extend(
+                        (column.name, value.copy())
+                        for column, value in zip(columns.expressions, values.expressions)
+                    )
+
+        if not projections:
+            return None
+
+        relations = []
+        if isinstance(expression.this, exp.Table):
+            relations.append(expression.this.copy())
+
+        using = expression.args.get("using")
+        if isinstance(using, exp.Expr):
+            relations.append(using.copy())
+
+        return _projection_select(projections, relations, expression)
+
+    return None
+
+
+def _assignment_projections(assignments: t.Iterable[exp.Expr]) -> list[tuple[str, exp.Expr]]:
+    """The (target column, source expression) pairs of a SET clause."""
+    projections: list[tuple[str, exp.Expr]] = []
+
+    for assignment in assignments:
+        if not isinstance(assignment, exp.EQ):
+            continue
+
+        target = assignment.this
+        if isinstance(target, exp.Column):
+            projections.append((target.name, assignment.expression.copy()))
+        elif isinstance(target, exp.Tuple) and isinstance(assignment.expression, exp.Tuple):
+            # UPDATE t SET (a, b) = (1, 2)
+            projections.extend(
+                (column.name, value.copy())
+                for column, value in zip(target.expressions, assignment.expression.expressions)
+                if isinstance(column, exp.Column)
+            )
+
+    return projections
+
+
+def _projection_select(
+    projections: list[tuple[str, exp.Expr]], relations: list[exp.Expr], statement: exp.Expr
+) -> exp.Select:
+    select = exp.Select(expressions=[exp.alias_(e, name, copy=False) for name, e in projections])
+
+    if relations:
+        select.set("from_", exp.From(this=relations[0]))
+        for relation in relations[1:]:
+            select.append("joins", exp.Join(this=relation))
+
+    with_ = statement.args.get("with_")
+    if with_ is not None:
+        select.set("with_", with_.copy())
+
+    _name_subquery_projections(select)
+    return select
+
+
+def _leftmost_select(query: exp.Query) -> exp.Select | None:
+    node: exp.Expr = query
+    while isinstance(node, exp.Subquery):
+        node = node.this
+    while isinstance(node, exp.SetOperation):
+        node = node.this
+    return node if isinstance(node, exp.Select) else None
+
+
+def _rename_projections(query: exp.Query, names: list[str]) -> None:
+    """
+    Give the query's output projections the target names of an INSERT column list,
+    matched positionally. For a set operation the leftmost arm determines the
+    output names; the other arms are resolved by position when walking lineage.
+    """
+    select = _leftmost_select(query)
+    if select is None:
+        return
+
+    select.set(
+        "expressions",
+        [
+            exp.alias_(projection, names[index], copy=False)
+            if index < len(names) and not isinstance(projection, exp.Star)
+            # A star's expansion isn't known here, so it can't be mapped positionally
+            else projection
+            for index, projection in enumerate(select.selects)
+        ],
+    )
+
+
+def _name_subquery_projections(expression: exp.Expr) -> None:
+    """Name unnamed scalar-subquery projections so lineage can descend into them."""
+    for subquery in expression.find_all(exp.Subquery):
+        select = subquery.this
+        if not isinstance(select, exp.Select):
+            continue
+
+        selects = []
+        renamed = False
+        for index, projection in enumerate(select.selects):
+            if not projection.alias_or_name:
+                projection = exp.alias_(projection, f"_col_{index}", copy=False)
+                renamed = True
+            selects.append(projection)
+
+        if renamed:
+            select.set("expressions", selects)
 
 
 def to_node(

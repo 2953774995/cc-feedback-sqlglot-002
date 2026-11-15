@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import sqlglot
+from sqlglot.errors import SqlglotError
 from sqlglot.lineage import lineage
 from sqlglot.schema import MappingSchema
 
@@ -1379,3 +1380,128 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+    def test_lineage_insert_select(self) -> None:
+        # INSERT column list maps positionally onto the query's projections.
+        node = lineage("b", "INSERT INTO t2 (b, a) SELECT c, a FROM t1", schema=None)
+        self.assertEqual(node.name, "b")
+        self.assertEqual([d.name for d in node.downstream], ["t1.c"])
+        self.assertEqual(node.downstream[0].source.sql(), "t1 AS t1")
+
+        # The sibling target column is mapped to its own projection.
+        node = lineage("a", "INSERT INTO t2 (b, a) SELECT c, a FROM t1", schema=None)
+        self.assertEqual([d.name for d in node.downstream], ["t1.a"])
+
+        # Projection aliases and table aliases are both handled.
+        node = lineage("b", "INSERT INTO t2 (b) SELECT t.c + 1 AS c FROM t1 AS t", schema=None)
+        self.assertEqual(node.name, "b")
+        self.assertEqual(node.source.sql(), "SELECT t.c + 1 AS b FROM t1 AS t")
+        self.assertEqual([d.name for d in node.downstream], ["t.c"])
+        self.assertEqual(node.downstream[0].source.sql(), "t1 AS t")
+
+        # Without a column list, the target columns are the projections' names.
+        node = lineage("c", "INSERT INTO t2 SELECT c, a FROM t1", schema=None)
+        self.assertEqual([d.name for d in node.downstream], ["t1.c"])
+
+        # An unknown column must still raise.
+        with self.assertRaises(SqlglotError):
+            lineage("zzz", "INSERT INTO t2 (a) SELECT a FROM t1", schema=None)
+
+    def test_lineage_update_from(self) -> None:
+        node = lineage("b", "UPDATE t2 SET b = s.x FROM src AS s WHERE t2.id = s.id", schema=None)
+        self.assertEqual(node.name, "b")
+        self.assertEqual([d.name for d in node.downstream], ["s.x"])
+        self.assertEqual(node.downstream[0].source.sql(), "src AS s")
+
+        # Joins in the FROM clause stay visible as the source of the column.
+        node = lineage("a", "UPDATE t2 SET a = y.y FROM x JOIN y ON x.id = y.id", schema=None)
+        self.assertEqual([d.name for d in node.downstream], ["y.y"])
+        self.assertIn("JOIN y", node.source.sql())
+
+        with self.assertRaises(SqlglotError):
+            lineage("zzz", "UPDATE t2 SET b = s.x FROM src AS s", schema=None)
+
+    def test_lineage_update_scalar_subquery(self) -> None:
+        node = lineage("b", "UPDATE t2 SET b = (SELECT MAX(v) FROM t3)", schema=None)
+        self.assertEqual(node.name, "b")
+        subquery_node = node.downstream[0]
+        self.assertEqual([d.name for d in subquery_node.downstream], ["t3.v"])
+        self.assertEqual(subquery_node.downstream[0].source.sql(), "t3 AS t3")
+
+        # Looking up a column that isn't assigned must raise.
+        with self.assertRaises(SqlglotError):
+            lineage("zzz", "UPDATE t2 SET b = (SELECT MAX(v) FROM t3)", schema=None)
+
+    def test_lineage_merge(self) -> None:
+        matched = (
+            "MERGE INTO tgt USING src ON tgt.id = src.id "
+            "WHEN MATCHED THEN UPDATE SET b = src.x"
+        )
+        node = lineage("b", matched, schema=None)
+        self.assertEqual(node.name, "b")
+        self.assertEqual([d.name for d in node.downstream], ["src.x"])
+        self.assertEqual(node.downstream[0].source.sql(), "src AS src")
+
+        not_matched = (
+            "MERGE INTO tgt USING src ON tgt.id = src.id "
+            "WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.y)"
+        )
+        node = lineage("b", not_matched, schema=None)
+        self.assertEqual([d.name for d in node.downstream], ["src.y"])
+        self.assertEqual(node.downstream[0].source.sql(), "src AS src")
+
+        # When both branches assign the same column, the first assignment wins,
+        # mirroring how repeated SET assignments are resolved.
+        node = lineage(
+            "b",
+            "MERGE INTO tgt USING src ON tgt.id = src.id "
+            "WHEN MATCHED THEN UPDATE SET b = src.x "
+            "WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.y)",
+            schema=None,
+        )
+        self.assertEqual([d.name for d in node.downstream], ["src.x"])
+
+        node = lineage(
+            "a",
+            "MERGE INTO tgt USING src ON tgt.id = src.id "
+            "WHEN MATCHED THEN UPDATE SET b = src.x "
+            "WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.y)",
+            schema=None,
+        )
+        self.assertEqual([d.name for d in node.downstream], ["src.a"])
+
+        with self.assertRaises(SqlglotError):
+            lineage("zzz", matched, schema=None)
+
+    def test_lineage_dml_all_columns(self) -> None:
+        result = lineage(None, "INSERT INTO t2 (b, a) SELECT c, a FROM t1", schema=None)
+        self.assertEqual(set(result), {"b", "a"})
+        self.assertEqual([d.name for d in result["b"].downstream], ["t1.c"])
+        self.assertEqual([d.name for d in result["a"].downstream], ["t1.a"])
+
+        result = lineage(
+            None,
+            "MERGE INTO tgt USING src ON tgt.id = src.id "
+            "WHEN MATCHED THEN UPDATE SET b = src.x "
+            "WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.y)",
+            schema=None,
+        )
+        self.assertEqual(set(result), {"a", "b"})
+        self.assertEqual([d.name for d in result["a"].downstream], ["src.a"])
+
+    def test_lineage_dml_does_not_mutate_input(self) -> None:
+        for sql in (
+            "INSERT INTO t2 (b, a) SELECT c, a FROM t1",
+            "UPDATE t2 SET b = s.x FROM src AS s",
+            "UPDATE t2 SET b = (SELECT MAX(v) FROM t3)",
+            "MERGE INTO tgt USING src ON tgt.id = src.id "
+            "WHEN MATCHED THEN UPDATE SET b = src.x",
+        ):
+            ast = sqlglot.parse_one(sql)
+            expected = ast.sql()
+
+            lineage("b", ast, schema=None, copy=False)
+            self.assertEqual(ast.sql(), expected)
+
+            lineage("b", ast, schema=None, copy=True)
+            self.assertEqual(ast.sql(), expected)
